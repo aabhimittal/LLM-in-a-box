@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: streamlit-config
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+    app.kubernetes.io/component: ui
+data:
+  # In-cluster address of the vLLM OpenAI-compatible endpoint.
+  VLLM_BASE_URL: "http://vllm:8000/v1"
+  # Must match `SERVED_MODEL_NAME` in the vLLM ConfigMap. Leave empty to let
+  # the UI auto-discover the served model from /v1/models.
+  VLLM_MODEL: "llama-3-8b-instruct"
+  APP_TITLE: "LLM-in-a-Box"

@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamlit
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+    app.kubernetes.io/component: ui
+spec:
+  # ClusterIP keeps the UI internal; expose it via the Ingress (ingress.yaml)
+  # or `kubectl port-forward`. Switch to NodePort/LoadBalancer for direct access.
+  type: ClusterIP
+  selector:
+    app: streamlit
+  ports:
+    - name: http
+      port: 8501
+      targetPort: http
+      protocol: TCP

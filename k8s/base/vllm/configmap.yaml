@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-config
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+    app.kubernetes.io/component: vllm
+data:
+  # Model to serve. Any HuggingFace model id compatible with vLLM works.
+  # Gated models (e.g. meta-llama/*) require a valid HF token in the
+  # `vllm-secrets` Secret (see hf-token-secret.example.yaml).
+  MODEL_ID: "meta-llama/Meta-Llama-3-8B-Instruct"
+
+  # Friendly alias clients use to select the model. Keep it stable so the UI
+  # and API consumers don't have to change when you swap the underlying model.
+  SERVED_MODEL_NAME: "llama-3-8b-instruct"
+
+  # Fraction of GPU memory vLLM may use for weights + KV cache (0.0-1.0).
+  GPU_MEMORY_UTILIZATION: "0.90"
+
+  # Maximum context length. Lower this if the model does not fit in memory.
+  MAX_MODEL_LEN: "8192"
+
+  # Tensor-parallel size. Set to the number of GPUs on a single node.
+  TENSOR_PARALLEL_SIZE: "1"
+
+  # Where downloaded weights are cached (backed by a PersistentVolume).
+  HF_HOME: "/models"

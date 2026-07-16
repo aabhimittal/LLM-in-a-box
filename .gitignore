@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.eggs/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Environment / secrets
+.env
+*.local.env
+k8s/base/vllm/hf-token-secret.yaml
+
+# Kubernetes / local tooling
+kubeconfig
+*.kubeconfig
+.kube/
+
+# Model cache (if run locally)
+models/
+*.safetensors
+*.bin
+*.gguf
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Stray downloaded artifacts
+*.whl

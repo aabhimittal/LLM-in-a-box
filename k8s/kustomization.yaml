@@ -1,0 +1,11 @@
+# Convenience wrapper so `kubectl apply -k k8s/` deploys the full base stack.
+# The actual manifests live in k8s/base/; overlays live in k8s/overlays/.
+#
+# The HuggingFace token Secret is intentionally NOT included; create it
+# separately (see k8s/base/vllm/hf-token-secret.example.yaml) so real
+# credentials never live in version control.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - base

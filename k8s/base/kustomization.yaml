@@ -1,0 +1,21 @@
+# Base kustomization — the full stack in dependency order.
+#
+#   kubectl apply -k k8s/        # via the k8s/ wrapper
+#   kubectl apply -k k8s/base/   # equivalent, directly
+#
+# The HuggingFace token Secret is intentionally NOT included here; create it
+# separately (see vllm/hf-token-secret.example.yaml) so real credentials
+# never live in version control.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - vllm/configmap.yaml
+  - vllm/pvc.yaml
+  - vllm/deployment.yaml
+  - vllm/service.yaml
+  - streamlit/configmap.yaml
+  - streamlit/deployment.yaml
+  - streamlit/service.yaml
+  - ingress.yaml

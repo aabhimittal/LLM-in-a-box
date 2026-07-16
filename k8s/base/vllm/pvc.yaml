@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-models
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+    app.kubernetes.io/component: vllm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Llama-3-8B weights are ~16Gi; leave headroom for the HF cache and
+      # additional models. Increase for larger models.
+      storage: 50Gi
+  # k3s ships with the `local-path` provisioner as the default StorageClass.
+  # Uncomment and set explicitly if your cluster uses a different one.
+  # storageClassName: local-path
