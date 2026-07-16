@@ -19,7 +19,7 @@ else
 fi
 
 echo "==> Creating namespace"
-kubectl apply -f "${ROOT_DIR}/k8s/namespace.yaml"
+kubectl apply -f "${ROOT_DIR}/k8s/base/namespace.yaml"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
   echo "==> Creating/updating HuggingFace token secret"

@@ -13,7 +13,7 @@ env/
 # Environment / secrets
 .env
 *.local.env
-k8s/vllm/hf-token-secret.yaml
+k8s/base/vllm/hf-token-secret.yaml
 
 # Kubernetes / local tooling
 kubeconfig

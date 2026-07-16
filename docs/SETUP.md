@@ -65,7 +65,7 @@ kubectl -n llm-in-a-box create secret generic vllm-secrets \
   --from-literal=HF_TOKEN='hf_xxxxxxxxxxxxxxxxx'
 ```
 
-Never commit the real token. `k8s/vllm/hf-token-secret.example.yaml` is a
+Never commit the real token. `k8s/base/vllm/hf-token-secret.example.yaml` is a
 template; a filled-in `hf-token-secret.yaml` is git-ignored.
 
 ## CPU-only testing

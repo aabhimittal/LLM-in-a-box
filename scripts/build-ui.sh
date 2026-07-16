@@ -20,7 +20,7 @@ else
   cat <<EOF
 ==> k3s not detected locally.
     Push the image to a registry reachable by your cluster and update
-    k8s/streamlit/deployment.yaml (or run: kubectl -n llm-in-a-box set image \\
+    k8s/base/streamlit/deployment.yaml (or run: kubectl -n llm-in-a-box set image \\
     deployment/streamlit streamlit=<registry>/${IMAGE}).
 EOF
 fi

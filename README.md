@@ -35,11 +35,13 @@ self-hosted, no external API calls.
 │   ├── Dockerfile
 │   └── .streamlit/config.toml
 ├── k8s/                      # Kubernetes / k3s manifests
-│   ├── namespace.yaml
-│   ├── vllm/                 #   model server (Deployment, Service, PVC, Config, Secret)
-│   ├── streamlit/            #   UI (Deployment, Service, Config)
-│   ├── ingress.yaml          #   Traefik ingress for the UI
-│   ├── kustomization.yaml    #   base: `kubectl apply -k k8s/`
+│   ├── kustomization.yaml    #   wrapper: `kubectl apply -k k8s/`
+│   ├── base/                 #   the full stack
+│   │   ├── namespace.yaml
+│   │   ├── vllm/             #     model server (Deployment, Service, PVC, Config, Secret)
+│   │   ├── streamlit/        #     UI (Deployment, Service, Config)
+│   │   ├── ingress.yaml      #     Traefik ingress for the UI
+│   │   └── kustomization.yaml
 │   └── overlays/cpu-test/    #   GPU-free smoke-test overlay (TinyLlama)
 ├── scripts/                  # install / build / deploy / test helpers
 ├── Makefile                  # `make help` for all tasks
@@ -119,7 +121,7 @@ CPU-capable vLLM images.
 ## Configuration
 
 The model and serving parameters live in
-[`k8s/vllm/configmap.yaml`](k8s/vllm/configmap.yaml):
+[`k8s/base/vllm/configmap.yaml`](k8s/base/vllm/configmap.yaml):
 
 | Key                      | Default                              | Description                                  |
 | ------------------------ | ------------------------------------ | -------------------------------------------- |
@@ -129,7 +131,7 @@ The model and serving parameters live in
 | `MAX_MODEL_LEN`          | `8192`                               | Max context length                           |
 | `TENSOR_PARALLEL_SIZE`   | `1`                                  | Number of GPUs to shard the model across     |
 
-The UI is configured via [`k8s/streamlit/configmap.yaml`](k8s/streamlit/configmap.yaml)
+The UI is configured via [`k8s/base/streamlit/configmap.yaml`](k8s/base/streamlit/configmap.yaml)
 (`VLLM_BASE_URL`, `VLLM_MODEL`, `APP_TITLE`). To swap models, edit the ConfigMap
 values and re-apply — no image rebuild required.
 
