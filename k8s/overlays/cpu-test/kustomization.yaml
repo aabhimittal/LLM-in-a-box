@@ -12,16 +12,11 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# Build on top of the base kustomization (referencing the base directory keeps
+# kustomize's path restrictions happy — individual `../../file.yaml` resources
+# are disallowed).
 resources:
-  - ../../namespace.yaml
-  - ../../vllm/configmap.yaml
-  - ../../vllm/pvc.yaml
-  - ../../vllm/deployment.yaml
-  - ../../vllm/service.yaml
-  - ../../streamlit/configmap.yaml
-  - ../../streamlit/deployment.yaml
-  - ../../streamlit/service.yaml
-  - ../../ingress.yaml
+  - ../../
 
 patches:
   # Serve a small ungated model that fits on CPU/limited RAM.
