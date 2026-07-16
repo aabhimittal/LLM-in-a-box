@@ -1,0 +1,56 @@
+# CPU-only overlay for smoke-testing the full stack without a GPU.
+#
+#   kubectl apply -k k8s/overlays/cpu-test/
+#
+# It swaps in a tiny, ungated model (TinyLlama) and removes the GPU resource
+# request so vLLM runs on CPU. Generation is slow but the end-to-end path
+# (vLLM API -> Streamlit UI) works, which is ideal for CI and local demos.
+#
+# NOTE: the upstream `vllm/vllm-openai` image is CUDA-based. For a pure-CPU
+# demo you generally need a CPU build of vLLM; see docs/SETUP.md for the
+# recommended image/build. This overlay covers the Kubernetes wiring.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../namespace.yaml
+  - ../../vllm/configmap.yaml
+  - ../../vllm/pvc.yaml
+  - ../../vllm/deployment.yaml
+  - ../../vllm/service.yaml
+  - ../../streamlit/configmap.yaml
+  - ../../streamlit/deployment.yaml
+  - ../../streamlit/service.yaml
+  - ../../ingress.yaml
+
+patches:
+  # Serve a small ungated model that fits on CPU/limited RAM.
+  - target:
+      kind: ConfigMap
+      name: vllm-config
+    patch: |
+      - op: replace
+        path: /data/MODEL_ID
+        value: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+      - op: replace
+        path: /data/SERVED_MODEL_NAME
+        value: "tinyllama-1.1b-chat"
+      - op: replace
+        path: /data/MAX_MODEL_LEN
+        value: "2048"
+
+  - target:
+      kind: ConfigMap
+      name: streamlit-config
+    patch: |
+      - op: replace
+        path: /data/VLLM_MODEL
+        value: "tinyllama-1.1b-chat"
+
+  # Drop the GPU request so the pod schedules on a CPU-only node.
+  - target:
+      kind: Deployment
+      name: vllm
+    patch: |
+      - op: remove
+        path: /spec/template/spec/containers/0/resources/limits/nvidia.com~1gpu

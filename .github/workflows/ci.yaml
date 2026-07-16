@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ui:
+    name: Lint & build UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install UI dependencies
+        run: pip install -r ui/requirements.txt
+
+      - name: Syntax-check the app
+        run: python -m py_compile ui/app.py
+
+      - name: Build UI image
+        run: docker build -t llm-in-a-box/streamlit-ui:ci ui/
+
+  manifests:
+    name: Validate Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          sudo mv /tmp/kubeconform /usr/local/bin/
+
+      - name: Render kustomize base
+        run: |
+          kubectl kustomize k8s/ > /tmp/base.yaml
+          kubectl kustomize k8s/overlays/cpu-test/ > /tmp/cpu.yaml
+
+      - name: Validate schemas
+        run: |
+          kubeconform -strict -summary -ignore-missing-schemas /tmp/base.yaml
+          kubeconform -strict -summary -ignore-missing-schemas /tmp/cpu.yaml

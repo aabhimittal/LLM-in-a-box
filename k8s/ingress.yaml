@@ -1,0 +1,27 @@
+# Exposes the Streamlit UI through k3s's built-in Traefik ingress controller.
+# Reach it at http://llm.localhost once the ingress is applied (add a hosts
+# entry mapping llm.localhost to your node IP if needed).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-in-a-box
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+  annotations:
+    # Streamlit uses websockets for live updates; Traefik handles these on the
+    # same route, so no extra annotation is required for the default setup.
+    ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: llm.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: streamlit
+                port:
+                  number: 8501
