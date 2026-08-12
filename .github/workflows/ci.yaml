@@ -6,6 +6,28 @@ on:
   pull_request:
 
 jobs:
+  tests:
+    name: llmbox test suite
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # llmbox is dependency-free by design, so the test suite needs only pytest.
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
   ui:
     name: Lint & build UI
     runs-on: ubuntu-latest
@@ -21,10 +43,11 @@ jobs:
         run: pip install -r ui/requirements.txt
 
       - name: Syntax-check the app
-        run: python -m py_compile ui/app.py
+        run: python -m py_compile ui/app.py llmbox/*.py
 
+      # Context is the repo root so the llmbox package ships with the image.
       - name: Build UI image
-        run: docker build -t llm-in-a-box/streamlit-ui:ci ui/
+        run: docker build -f ui/Dockerfile -t llm-in-a-box/streamlit-ui:ci .
 
   manifests:
     name: Validate Kubernetes manifests
@@ -39,12 +62,16 @@ jobs:
           tar -xzf /tmp/kubeconform.tar.gz -C /tmp
           sudo mv /tmp/kubeconform /usr/local/bin/
 
-      - name: Render kustomize base
+      - name: Render kustomize builds
         run: |
           kubectl kustomize k8s/ > /tmp/base.yaml
           kubectl kustomize k8s/overlays/cpu-test/ > /tmp/cpu.yaml
+          kubectl kustomize k8s/overlays/observability/ > /tmp/obs.yaml
 
       - name: Validate schemas
         run: |
           kubeconform -strict -summary -ignore-missing-schemas /tmp/base.yaml
           kubeconform -strict -summary -ignore-missing-schemas /tmp/cpu.yaml
+          # The observability overlay carries Prometheus Operator CRDs, whose
+          # schemas are not in the default catalogue; they are skipped.
+          kubeconform -strict -summary -ignore-missing-schemas /tmp/obs.yaml

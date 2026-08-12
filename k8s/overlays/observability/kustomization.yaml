@@ -1,0 +1,14 @@
+# Prometheus Operator integration.
+#
+#   kubectl apply -k k8s/overlays/observability/
+#
+# Requires the Prometheus Operator CRDs (ServiceMonitor, PrometheusRule) to be
+# installed in the cluster. Kept in an overlay so the base stack applies cleanly
+# on a plain k3s cluster with no monitoring stack.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - servicemonitor.yaml
+  - prometheusrule.yaml

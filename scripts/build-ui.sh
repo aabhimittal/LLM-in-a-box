@@ -7,7 +7,8 @@ IMAGE="${IMAGE:-llm-in-a-box/streamlit-ui:latest}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "==> Building ${IMAGE}"
-docker build -t "${IMAGE}" "${ROOT_DIR}/ui"
+# Build context is the repo root so the llmbox package ships with the UI.
+docker build -f "${ROOT_DIR}/ui/Dockerfile" -t "${IMAGE}" "${ROOT_DIR}"
 
 # k3s uses containerd, not the Docker daemon, so a locally-built Docker image
 # is not visible to the cluster by default. Import it directly when k3s is

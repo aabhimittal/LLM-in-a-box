@@ -20,8 +20,17 @@ self-hosted, no external API calls.
 * **Streamlit** provides a streaming chat interface and talks to vLLM using the
   standard `openai` Python client — so you can point it at any OpenAI-compatible
   backend.
-* Everything is packaged as plain Kubernetes manifests plus a Kustomize base and
-  a CPU-only test overlay.
+* **`llmbox`** is a dependency-free serving-edge library sitting between the two:
+  context budgeting, token-priced rate limiting, deterministic response caching
+  with stampede protection, PII redaction, prompt-injection screening, circuit
+  breaking with jittered retries, and structured telemetry.
+* Everything is packaged as plain Kubernetes manifests plus a Kustomize base, a
+  CPU-only test overlay and a Prometheus overlay.
+
+Every production behaviour above is covered by a **172-test suite that needs no
+GPU and no cluster** and runs in ~2 seconds (`make test`). See
+[`docs/EDGE-CASES.md`](docs/EDGE-CASES.md) for the catalogue of failure modes
+handled and where each is tested.
 
 ---
 
@@ -29,10 +38,22 @@ self-hosted, no external API calls.
 
 ```
 .
+├── llmbox/                   # Serving-edge library (stdlib only, no deps)
+│   ├── tokens.py             #   script-aware token estimation
+│   ├── context.py            #   context-window budgeting & safe truncation
+│   ├── ratelimit.py          #   token-bucket admission control
+│   ├── cache.py              #   LRU+TTL cache and single-flight
+│   ├── guardrails.py         #   PII redaction, prompt-injection screening
+│   ├── resilience.py         #   circuit breaker, retry with full jitter
+│   ├── observability.py      #   structured logs, Prometheus metrics
+│   └── client.py             #   composes all of the above
+├── tests/                    # 172 tests; no GPU or cluster required
+│   ├── test_edge_cases.py    #   industrial failure scenarios
+│   └── test_integration_openai.py  # real openai SDK vs a stub vLLM server
 ├── ui/                       # Streamlit chat application
-│   ├── app.py                #   streaming chat UI (OpenAI client -> vLLM)
+│   ├── app.py                #   streaming chat UI built on llmbox
 │   ├── requirements.txt
-│   ├── Dockerfile
+│   ├── Dockerfile            #   build from repo root: -f ui/Dockerfile .
 │   └── .streamlit/config.toml
 ├── k8s/                      # Kubernetes / k3s manifests
 │   ├── kustomization.yaml    #   wrapper: `kubectl apply -k k8s/`
@@ -41,11 +62,15 @@ self-hosted, no external API calls.
 │   │   ├── vllm/             #     model server (Deployment, Service, PVC, Config, Secret)
 │   │   ├── streamlit/        #     UI (Deployment, Service, Config)
 │   │   ├── ingress.yaml      #     Traefik ingress for the UI
+│   │   ├── pdb.yaml          #     PodDisruptionBudgets
+│   │   ├── networkpolicy.yaml#     restrict who may call the inference API
 │   │   └── kustomization.yaml
-│   └── overlays/cpu-test/    #   GPU-free smoke-test overlay (TinyLlama)
+│   └── overlays/
+│       ├── cpu-test/         #   GPU-free smoke-test overlay (TinyLlama)
+│       └── observability/    #   ServiceMonitor + alerting rules
 ├── scripts/                  # install / build / deploy / test helpers
 ├── Makefile                  # `make help` for all tasks
-└── docs/                     # ARCHITECTURE.md, SETUP.md
+└── docs/                     # ARCHITECTURE.md, SETUP.md, EDGE-CASES.md
 ```
 
 ---
@@ -135,6 +160,39 @@ The UI is configured via [`k8s/base/streamlit/configmap.yaml`](k8s/base/streamli
 (`VLLM_BASE_URL`, `VLLM_MODEL`, `APP_TITLE`). To swap models, edit the ConfigMap
 values and re-apply — no image rebuild required.
 
+### Serving edge
+
+The same ConfigMap tunes the `llmbox` layer:
+
+| Key                          | Default | Description                                              |
+| ---------------------------- | ------- | -------------------------------------------------------- |
+| `LLMBOX_MAX_MODEL_LEN`       | `8192`  | **Must match** vLLM's `MAX_MODEL_LEN`                     |
+| `LLMBOX_MAX_OUTPUT_TOKENS`   | `512`   | Tokens held back for the reply when budgeting the prompt  |
+| `LLMBOX_TOKENS_PER_MINUTE`   | `60000` | Sustained per-user token budget                           |
+| `LLMBOX_BURST_TOKENS`        | `20000` | Per-user burst capacity                                   |
+| `LLMBOX_CACHE_ENTRIES`       | `512`   | Max cached responses                                      |
+| `LLMBOX_CACHE_TTL`           | `300`   | Cache TTL in seconds                                      |
+| `LLMBOX_INJECTION_THRESHOLD` | `0.6`   | Prompt-injection block score in `[0,1]`                   |
+
+Rate limiting is priced in **tokens, not requests**, so a handful of very large
+prompts cannot monopolise the GPU while staying under a request-count cap. Only
+`temperature=0` responses are cached — replaying a sampled completion would
+silently destroy sampling diversity.
+
+### Using `llmbox` on its own
+
+The library has no dependencies and no HTTP coupling — the backend is any
+callable — so it works in front of any OpenAI-compatible server:
+
+```python
+from llmbox import build_client
+
+client = build_client(backend=my_backend, model="llama-3-8b-instruct",
+                      max_model_len=8192)
+result = client.chat([{"role": "user", "content": "Hello"}])
+print(result.text, result.prompt_tokens, result.cached)
+```
+
 ---
 
 ## Using the raw API
@@ -159,6 +217,7 @@ Or run the bundled smoke test: `make smoke-test`.
 
 ```bash
 make help          # list every target
+make test          # run the llmbox test suite (no GPU, no cluster, ~2s)
 make status        # pods, services, ingress
 make logs          # tail vLLM logs
 make lint          # client-side validate all manifests
@@ -171,6 +230,7 @@ make clean         # tear everything down
 
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the components fit together.
 * [`docs/SETUP.md`](docs/SETUP.md) — full cluster + GPU prerequisites and troubleshooting.
+* [`docs/EDGE-CASES.md`](docs/EDGE-CASES.md) — the production failure modes handled, and where each is tested.
 
 ## License
 

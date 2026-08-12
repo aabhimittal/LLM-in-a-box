@@ -30,13 +30,44 @@ more shared memory than the container default.
 ### Streamlit UI
 
 * **Image:** built from `ui/Dockerfile` (Python 3.11 slim + Streamlit +
-  `openai`).
-* **What it does:** renders a streaming chat interface. It uses the `openai`
-  client pointed at the in-cluster vLLM Service, so it is backend-agnostic.
+  `openai`), with the build context at the repository root so the `llmbox`
+  package ships alongside the app.
+* **What it does:** renders a streaming chat interface. All production
+  behaviour is delegated to `llmbox`; the module itself is presentation only.
 * **Model selection:** if `VLLM_MODEL` is set it uses that; otherwise it calls
   `/v1/models` and picks the first served model automatically.
 * **Health:** a sidebar indicator calls `/v1/models` to show whether vLLM is
-  reachable and which model is live.
+  reachable and which model is live, alongside live cache hit-rate, circuit
+  state and the raw Prometheus exposition.
+
+Streamlit re-runs the whole script on every interaction, so the `llmbox` client
+is built inside `@st.cache_resource`. That is not an optimisation: the cache,
+rate-limiter buckets and circuit-breaker state are meaningless if they are
+rebuilt on each keystroke.
+
+### `llmbox` — the serving edge
+
+A dependency-free library between the UI and vLLM. Each concern is independently
+testable and injectable; the composed order in `client.py` is deliberate:
+
+| Stage | Module | Why it sits here |
+| --- | --- | --- |
+| 1. Guardrails | `guardrails.py` | Cheapest check, and must run before the text is used for anything — including logging. |
+| 2. Context budgeting | `context.py` | Determines the true token cost the limiter needs, and guarantees the request *can* succeed. |
+| 3. Rate limiting | `ratelimit.py` | Priced in tokens, not requests. |
+| 4. Cache | `cache.py` | Consulted only for deterministic requests. |
+| 5. Single-flight | `cache.py` | Collapses a concurrent herd onto one generation. |
+| 6. Breaker → retry | `resilience.py` | The breaker is *inside* the retry loop, so an open circuit aborts immediately rather than burning the retry budget. |
+
+Supporting modules: `tokens.py` (script-aware estimation — the `len/4` rule
+undercounts CJK by 3-5x), `observability.py` (JSON logs and a Prometheus
+registry), `errors.py` (a typed hierarchy so callers branch on structure, not on
+error strings).
+
+The backend is an injected callable `(payload, stream) -> response`, which is
+why the library has no HTTP dependency and the whole suite runs without a
+server. See [`EDGE-CASES.md`](EDGE-CASES.md) for the failure modes each layer
+addresses.
 
 ### Networking
 
@@ -52,6 +83,11 @@ Browser
   │  HTTP / websocket
   ▼
 Ingress (Traefik)  ──►  Service streamlit:8501  ──►  Streamlit pod
+                                                        │
+                                                        ▼
+                                            llmbox: guardrails → budget →
+                                            rate limit → cache → single-flight
+                                            → breaker → retry
                                                         │  openai client
                                                         │  POST /v1/chat/completions (stream=true)
                                                         ▼
@@ -59,10 +95,14 @@ Ingress (Traefik)  ──►  Service streamlit:8501  ──►  Streamlit pod
 ```
 
 1. The user sends a message in the browser.
-2. Streamlit builds the payload (system prompt + conversation history) and calls
-   vLLM's `/v1/chat/completions` with `stream=true`.
-3. vLLM generates tokens on the GPU and streams them back.
-4. Streamlit renders tokens incrementally in the chat window.
+2. `llmbox` screens the input, trims the conversation to fit the context window,
+   charges the user's token budget, and checks the cache. A cache hit or a
+   rejection returns here — the GPU is never touched.
+3. Otherwise the request goes upstream under the circuit breaker and retry
+   policy, with concurrent identical prompts collapsed into one call.
+4. vLLM generates tokens on the GPU and streams them back.
+5. Streamlit renders tokens incrementally, and surfaces any trimming, truncation
+   or redaction that occurred as a caption under the reply.
 
 ## Design choices
 

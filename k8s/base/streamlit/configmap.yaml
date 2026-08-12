@@ -13,3 +13,23 @@ data:
   # the UI auto-discover the served model from /v1/models.
   VLLM_MODEL: "llama-3-8b-instruct"
   APP_TITLE: "LLM-in-a-Box"
+
+  # --- serving-edge (llmbox) settings ------------------------------------- #
+  # MUST match MAX_MODEL_LEN in the vLLM ConfigMap. If this is larger, prompts
+  # are admitted that the server will reject with a 400.
+  LLMBOX_MAX_MODEL_LEN: "8192"
+  # Tokens held back for the completion when budgeting the prompt.
+  LLMBOX_MAX_OUTPUT_TOKENS: "512"
+
+  # Per-user admission control, priced in tokens rather than requests so a few
+  # very large prompts cannot monopolise the GPU while looking compliant.
+  LLMBOX_TOKENS_PER_MINUTE: "60000"
+  LLMBOX_BURST_TOKENS: "20000"
+
+  # Deterministic (temperature 0) responses are cached; sampled ones never are.
+  LLMBOX_CACHE_ENTRIES: "512"
+  LLMBOX_CACHE_TTL: "300"
+
+  # Prompt-injection block threshold in [0,1]. Lower catches more and produces
+  # more false positives; 0.6 requires either a strong signal or two weak ones.
+  LLMBOX_INJECTION_THRESHOLD: "0.6"

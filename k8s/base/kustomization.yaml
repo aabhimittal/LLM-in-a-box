@@ -19,3 +19,5 @@ resources:
   - streamlit/deployment.yaml
   - streamlit/service.yaml
   - ingress.yaml
+  - pdb.yaml
+  - networkpolicy.yaml

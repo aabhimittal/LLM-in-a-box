@@ -34,3 +34,6 @@ models/
 
 # Stray downloaded artifacts
 *.whl
+
+# Test artifacts
+.pytest_cache/

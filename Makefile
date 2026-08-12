@@ -41,6 +41,14 @@ ui-local: ## Run the Streamlit UI locally against a port-forwarded vLLM.
 	VLLM_BASE_URL=$${VLLM_BASE_URL:-http://localhost:8000/v1} \
 		streamlit run ui/app.py
 
+.PHONY: test
+test: ## Run the llmbox test suite (no cluster or GPU required).
+	python3 -m pytest -q
+
+.PHONY: test-verbose
+test-verbose: ## Run the test suite with per-test names.
+	python3 -m pytest -v
+
 .PHONY: logs
 logs: ## Tail vLLM server logs.
 	kubectl -n $(NS) logs -f deploy/vllm
@@ -51,7 +59,8 @@ status: ## Show pods, services and ingress in the namespace.
 
 .PHONY: lint
 lint: ## Validate all Kubernetes manifests (client-side dry run).
-	kubectl apply -k k8s/ --dry-run=client >/dev/null && echo "manifests OK"
+	kubectl apply -k k8s/ --dry-run=client >/dev/null && echo "base OK"
+	kubectl apply -k k8s/overlays/cpu-test/ --dry-run=client >/dev/null && echo "cpu-test OK"
 
 .PHONY: clean
 clean: ## Delete the entire deployment and namespace.
