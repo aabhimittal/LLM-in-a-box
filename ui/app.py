@@ -20,6 +20,15 @@ Configuration (all optional except the endpoint):
     LLMBOX_CACHE_TTL           Cache TTL in seconds (default 300)
     LLMBOX_CACHE_ENTRIES       Max cached responses (default 512)
     LLMBOX_INJECTION_THRESHOLD Block score in [0,1] (default 0.6)
+
+    LLMBOX_MAX_CONCURRENT      In-flight upstream requests allowed (default 16)
+    LLMBOX_STREAM_IDLE_TIMEOUT Seconds of silence before a stream is stalled
+                               (default 60; 0 disables the watchdog)
+    LLMBOX_MAX_QUEUE_DEPTH     Shed while vLLM's own queue is deeper (default 8)
+    LLMBOX_VLLM_METRICS_URL    vLLM /metrics URL; derived from VLLM_BASE_URL when
+                               unset, empty string disables queue-depth shedding
+    LLMBOX_METRICS_PORT        Port for this app's /metrics and /healthz
+                               (default 9100; 0 disables the server)
 """
 
 from __future__ import annotations
@@ -35,8 +44,11 @@ from llmbox import (
     CircuitOpen,
     ContextOverflow,
     GuardrailBlocked,
+    MetricsServer,
+    Overloaded,
     RateLimitExceeded,
     StreamInterrupted,
+    StreamStalled,
     UpstreamError,
     build_client,
 )
@@ -47,6 +59,14 @@ BASE_URL = os.getenv("VLLM_BASE_URL", "http://vllm:8000/v1")
 API_KEY = os.getenv("VLLM_API_KEY", "not-needed")
 CONFIGURED_MODEL = os.getenv("VLLM_MODEL", "").strip()
 APP_TITLE = os.getenv("APP_TITLE", "LLM-in-a-Box")
+
+
+def _vllm_metrics_url() -> str:
+    """vLLM serves /metrics next to /v1 on the same port."""
+    explicit = os.getenv("LLMBOX_VLLM_METRICS_URL")
+    if explicit is not None:
+        return explicit.strip()  # empty disables queue-depth shedding
+    return BASE_URL.rstrip("/").removesuffix("/v1") + "/metrics"
 
 
 def _int_env(name: str, default: int) -> int:
@@ -109,7 +129,33 @@ def get_llm(model: str):
         cache_entries=_int_env("LLMBOX_CACHE_ENTRIES", 512),
         cache_ttl=_float_env("LLMBOX_CACHE_TTL", 300.0),
         injection_threshold=_float_env("LLMBOX_INJECTION_THRESHOLD", 0.6),
+        max_concurrent=_int_env("LLMBOX_MAX_CONCURRENT", 16),
+        stream_idle_timeout=_float_env("LLMBOX_STREAM_IDLE_TIMEOUT", 60.0) or None,
+        metrics_url=_vllm_metrics_url() or None,
+        max_queue_depth=_float_env("LLMBOX_MAX_QUEUE_DEPTH", 8.0),
     )
+
+
+@st.cache_resource(show_spinner=False)
+def start_metrics_server(model: str) -> MetricsServer | None:
+    """Expose this pod's llmbox metrics for Prometheus to scrape.
+
+    vLLM's own /metrics cannot show requests that were rejected before reaching
+    it — rate limits, guardrail blocks, shed load — which is exactly what you
+    need when users report failures the model server never saw.
+    """
+    port = _int_env("LLMBOX_METRICS_PORT", 9100)
+    if port <= 0:
+        return None
+    llm = get_llm(model)
+    server = MetricsServer(
+        llm.metrics,
+        port=port,
+        # Readiness follows the backend: an open circuit means we cannot serve.
+        health=lambda: llm.breaker is None or llm.breaker.state.value != "open",
+    )
+    server.start()
+    return server
 
 
 def health() -> tuple[bool, str]:
@@ -162,15 +208,34 @@ with st.sidebar:
 
     if model:
         llm = get_llm(model)
+        metrics_server = start_metrics_server(model)
         st.divider()
         st.subheader("Serving edge")
         stats = llm.cache.stats
-        col_a, col_b = st.columns(2)
+        col_a, col_b, col_c = st.columns(3)
         col_a.metric("Cache hit rate", f"{stats.hit_rate:.0%}")
         col_b.metric("Circuit", llm.breaker.state.value)
+        if llm.bulkhead is not None:
+            col_c.metric(
+                "In flight", f"{llm.bulkhead.in_flight}/{llm.bulkhead.max_concurrent}"
+            )
         st.caption(
             f"cached entries: {len(llm.cache)} · hits {stats.hits} · misses {stats.misses}"
         )
+        if llm.bulkhead is not None and llm.bulkhead.rejections:
+            st.caption(
+                f"shed for concurrency: {llm.bulkhead.rejections} "
+                f"(peak in flight {llm.bulkhead.peak_in_flight})"
+            )
+        if llm.shedder is not None:
+            depth = llm.shedder.signal.value()
+            st.caption(
+                "upstream queue depth: "
+                + ("unknown" if depth is None else f"{depth:g}")
+                + f" · shed {llm.shedder.shed}"
+            )
+        if metrics_server is not None:
+            st.caption(f"scrape endpoint: `:{metrics_server.port}/metrics`")
         with st.expander("Prometheus metrics"):
             st.code(llm.metrics.render() or "(no samples yet)", language="text")
 
@@ -239,6 +304,27 @@ if prompt:
             st.warning(f"You've hit the per-user token budget.{wait}")
             st.session_state.messages.pop()
             st.stop()
+        except Overloaded as exc:
+            placeholder.empty()
+            wait = f" Try again in {exc.retry_after:.0f}s." if exc.retry_after else ""
+            if exc.source == "upstream_queue":
+                st.warning(
+                    f"The model server is saturated (queue depth {exc.depth:g})."
+                    f" Your request was shed to keep latency sane.{wait}"
+                )
+            else:
+                st.warning(f"This instance is at capacity right now.{wait}")
+            st.session_state.messages.pop()
+            st.stop()
+        except StreamStalled as exc:
+            # Distinct from a dropped connection: nothing failed, the server
+            # simply went quiet. Keep whatever arrived.
+            collected = exc.partial
+            placeholder.markdown(collected)
+            st.warning(
+                f"The model stopped producing tokens for {exc.idle_seconds:g}s; "
+                "the answer above is partial."
+            )
         except CircuitOpen as exc:
             placeholder.empty()
             st.error(

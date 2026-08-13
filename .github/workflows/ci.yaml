@@ -21,9 +21,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # llmbox is dependency-free by design, so the test suite needs only pytest.
+      # llmbox itself is dependency-free; the suite adds PyYAML to read the
+      # alerting rules and an optional PromQL parser to validate them.
       - name: Install test dependencies
-        run: pip install pytest
+        run: |
+          pip install pytest pyyaml
+          # Rust-backed wheel; may be unavailable for some interpreters, in
+          # which case the PromQL parse test skips instead of failing the build.
+          pip install promql-parser || echo "promql-parser unavailable; that test will skip"
 
       - name: Run tests
         run: python -m pytest -q

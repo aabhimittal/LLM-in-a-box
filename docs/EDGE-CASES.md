@@ -2,7 +2,7 @@
 
 This document catalogues the production failure modes LLM-in-a-Box handles, why
 each one matters on a single-GPU deployment, and where it is tested. Everything
-here runs in CI with no GPU and no cluster (`make test`, ~2s, 172 tests).
+here runs in CI with no GPU and no cluster (`make test`, 234 tests).
 
 The implementation lives in [`llmbox/`](../llmbox); the scenario tests are in
 [`tests/test_edge_cases.py`](../tests/test_edge_cases.py).
@@ -91,6 +91,9 @@ The limiter charges `prompt_tokens + max_tokens`:
 ```
 
 Tested in `test_token_pricing_stops_a_whale_that_request_counting_would_miss`.
+
+Rate limiting bounds a *single tenant's* rate. It does not bound total
+concurrency — see [§9](#9-silent-saturation) for the bulkhead that does.
 
 ### Other admission-control cases
 
@@ -209,6 +212,15 @@ The Prometheus exposition output is validated for well-formedness after mixed
 traffic including cache hits, rate-limit rejections and guardrail blocks
 (`test_metrics_exposition_is_well_formed_after_mixed_traffic`).
 
+Those metrics are **served**, not just collected: `MetricsServer` exposes
+`/metrics` and `/healthz` on port 9100 of the UI pod, scraped by a
+ServiceMonitor. This is the half of the picture vLLM cannot provide — a request
+rejected by a rate limit, a guardrail, or load shedding never reaches the model
+and so never appears in any `vllm:*` series. When users report failures the
+model server has no record of, this is where they are. `/healthz` reports 503
+while the circuit breaker is open, so readiness follows the backend rather than
+just the web process.
+
 ## 8. Cluster-level disruption
 
 Handled in manifests rather than code:
@@ -222,6 +234,87 @@ Handled in manifests rather than code:
 * **Alerts** on queue depth, KV-cache saturation and p95 time-to-first-token —
   the metrics that actually predict user-visible pain, in
   `k8s/overlays/observability/`.
+
+---
+
+## 9. Silent saturation
+
+The failure a circuit breaker structurally cannot see. When vLLM saturates it
+does not start failing — it starts **queueing**. Requests still succeed, just
+slower and slower, so error-rate-based protection never trips. Three controls
+cover it, each catching a case the others miss.
+
+### Bulkhead: bound total in-flight work
+
+The token-bucket limiter bounds one tenant's *rate*; it does not bound total
+*concurrency*. Without a ceiling, every arriving user gets another connection to
+vLLM and the real queue becomes invisible, unbounded and shared.
+
+| Failure | Behaviour | Test |
+| --- | --- | --- |
+| 20 concurrent requests, limit 4 | GPU never sees more than 4; the excess is rejected outright | `test_bulkhead_bounds_concurrent_load_on_the_gpu` |
+| Cache hit while at capacity | **Served** — a cache hit costs the GPU nothing, so rejecting it would be pure loss | `test_cache_hits_are_never_shed_for_load` |
+| Streaming request | Holds its slot until the last token, matching the connection's real lifetime | `test_bulkhead_slot_is_held_for_the_life_of_a_stream` |
+| User closes the tab mid-stream | Slot released via the generator's `finally` (runs on close/GC) | `test_abandoned_stream_releases_its_slot` |
+| Upstream call fails while opening a stream | Slot released, not leaked | `test_failed_stream_start_does_not_leak_a_slot` |
+| Double release | Raises loudly — silently tolerating it would inflate the effective limit with no trace | `test_double_release_is_a_loud_error` |
+| 40 threads contending | Never exceeds the limit | `test_never_oversells_under_contention` |
+
+### Stalled streams
+
+A stream that *fails* raises. A stream that simply **stops producing tokens**
+does not: the socket stays open, the iterator blocks forever, the user watches a
+cursor blink, and the request holds a slot and a connection indefinitely. HTTP
+read timeouts do not help — they are per-read, and a server that sends nothing
+at all never trips one.
+
+`iter_with_idle_timeout` puts a watchdog on the gap *between* tokens, draining
+the source on a helper thread so each wait can be time-boxed. The timer restarts
+per token, so a slow-but-steady generation is never interrupted
+(`test_slow_but_steady_stream_is_not_interrupted`) while a genuinely idle one
+raises `StreamStalled` **with the partial output preserved**
+(`test_stalled_stream_is_abandoned_with_partial_output`). Abandoning the stream
+stops the helper thread rather than leaking it
+(`test_abandoning_the_stream_stops_the_pump_thread`).
+
+### Shedding on the upstream's own queue depth
+
+Every other control infers upstream health indirectly — from errors, or from
+local concurrency. vLLM publishes the truth: `vllm:num_requests_waiting` is the
+number of requests admitted but not yet running, and it rises *before* latency
+degrades enough for users to complain.
+
+| Failure | Behaviour | Test |
+| --- | --- | --- |
+| Queue depth 20, limit 8 | Shed before adding to the queue; recovers automatically when it drains | `test_upstream_queue_depth_sheds_before_latency_collapses` |
+| Metrics endpoint down | **Fails open** — traffic flows | `test_a_broken_metrics_endpoint_does_not_stop_serving` |
+| Metric renamed between vLLM versions | Reported as *unknown*, not as zero — zero would read as "idle" | `test_missing_metric_reports_unknown` |
+| `/metrics` returns an HTML error page | Parsed to nothing; fails open | `test_fails_open_on_a_garbage_response` |
+| Brief scrape blip | Last reading reused; discarded once genuinely stale | `test_last_known_value_is_reused_briefly_then_discarded` |
+
+> **The rule, enforced by tests:** a monitoring failure must never become a
+> serving outage. Readings are cached for a TTL so the hot path does not pay a
+> network round trip for a value that changes on the scale of seconds.
+
+## 10. The alerting rules are tested too
+
+Alerting rules are code and break in the same quiet ways — except a broken rule
+fails by *never firing*, which nothing notices until the incident it was written
+for. [`tests/test_alerts.py`](../tests/test_alerts.py) checks that:
+
+* every expression is **valid PromQL**, parsed with a real parser rather than
+  eyeballed;
+* every alert carries a severity, a summary, a description and a `for` clause,
+  so it cannot flap or page without a runbook;
+* every `outcome="..."` selector names an outcome this codebase actually emits,
+  cross-checked against `KNOWN_OUTCOMES`;
+* every `llmbox_*` metric referenced exists, cross-checked against a registry
+  driven through real success, cache-hit, guardrail, overload and rate-limit
+  paths.
+
+The outcome check is not hypothetical: renaming `stream_stalled` to
+`stream_died` in the rules makes the suite fail with
+`alerts select outcomes never emitted: ['stream_died']`.
 
 ---
 

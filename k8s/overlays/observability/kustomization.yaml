@@ -11,4 +11,5 @@ kind: Kustomization
 resources:
   - ../../base
   - servicemonitor.yaml
+  - servicemonitor-streamlit.yaml
   - prometheusrule.yaml

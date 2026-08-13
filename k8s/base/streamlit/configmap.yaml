@@ -33,3 +33,22 @@ data:
   # Prompt-injection block threshold in [0,1]. Lower catches more and produces
   # more false positives; 0.6 requires either a strong signal or two weak ones.
   LLMBOX_INJECTION_THRESHOLD: "0.6"
+
+  # Hard ceiling on in-flight upstream requests from this pod. A saturated vLLM
+  # queues rather than failing, so without this the queue grows invisibly and
+  # latency collapses while every request still "succeeds".
+  LLMBOX_MAX_CONCURRENT: "16"
+
+  # Seconds of silence before a stream is treated as stalled. An open-but-quiet
+  # socket never raises on its own, so without this the UI hangs forever.
+  LLMBOX_STREAM_IDLE_TIMEOUT: "60"
+
+  # Shed requests while vLLM's own queue is deeper than this. Derived from the
+  # server's vllm:num_requests_waiting gauge; fails OPEN if /metrics is
+  # unreachable, so a monitoring outage never becomes a serving outage.
+  # Set LLMBOX_VLLM_METRICS_URL to "" to disable this entirely.
+  LLMBOX_MAX_QUEUE_DEPTH: "8"
+
+  # Port serving this app's own /metrics and /healthz. vLLM's metrics cannot
+  # show requests rejected before they reached it.
+  LLMBOX_METRICS_PORT: "9100"

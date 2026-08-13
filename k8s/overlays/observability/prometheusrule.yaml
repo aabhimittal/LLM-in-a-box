@@ -61,3 +61,43 @@ spec:
             description: >-
               The UI streams tokens, so TTFT is what users perceive as
               responsiveness. Sustained high TTFT usually means queueing.
+
+        - alert: LLMBoxSheddingLoad
+          # Requests rejected before reaching the model. Invisible in vllm:*.
+          expr: |
+            sum(rate(llmbox_requests_total{outcome=~"overloaded|rate_limited"}[5m])) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "The serving edge is shedding requests"
+            description: >-
+              Sustained rejections for load. Either the GPU is undersized for
+              demand, or LLMBOX_MAX_CONCURRENT / the per-user token budget is
+              set too low for legitimate traffic.
+
+        - alert: LLMBoxStreamsStalling
+          expr: sum(rate(llmbox_requests_total{outcome="stream_stalled"}[15m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Token streams are stalling mid-generation"
+            description: >-
+              The model server accepted requests then went silent. Usually
+              preemption under KV-cache pressure; check
+              vllm:gpu_cache_usage_perc and num_requests_waiting.
+
+        - alert: LLMBoxUpstreamErrorsUsersSee
+          expr: |
+            sum(rate(llmbox_requests_total{outcome=~"upstream_error|circuit_open"}[5m]))
+            /
+            clamp_min(sum(rate(llmbox_requests_total[5m])), 0.001) > 0.05
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "More than 5% of chat requests are failing"
+            description: >-
+              Measured at the serving edge rather than on the model server, so
+              it includes failures vLLM never saw.

@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .cache import PromptCache, SingleFlight, make_key
+from .concurrency import Bulkhead
 from .context import ContextBudget
 from .errors import (
     GuardrailBlocked,
@@ -34,9 +35,11 @@ from .errors import (
     UpstreamError,
 )
 from .guardrails import InjectionDetector, Redactor
+from .loadsignal import QueueDepthShedder
 from .observability import Metrics, StructuredLogger, new_request_id
 from .ratelimit import RateLimiter
 from .resilience import CircuitBreaker, RetryPolicy
+from .streaming import iter_with_idle_timeout
 from .tokens import estimate_tokens
 
 Backend = Callable[[dict, bool], Any]
@@ -137,31 +140,62 @@ class StreamHandle:
         source: Iterator[str],
         result: ChatResult,
         on_done: Callable[[ChatResult, str], None],
+        on_close: Callable[[], None] | None = None,
     ):
         self._source = source
         self._on_done = on_done
+        # Frees resources held for the stream's lifetime (a bulkhead slot, which
+        # models the upstream connection staying open until the last token).
+        self._on_close = on_close
         self.result = result
         self._finished = False
+        self._closed = False
 
     def __iter__(self) -> Iterator[str]:
         parts: list[str] = []
         try:
-            for delta in self._source:
-                parts.append(delta)
-                yield delta
-        except LLMBoxError as exc:
+            try:
+                for delta in self._source:
+                    parts.append(delta)
+                    yield delta
+            except LLMBoxError as exc:
+                partial = "".join(parts)
+                self.result.text = partial
+                # A stall or interruption raised from deeper in the stack has no
+                # way to know what was already delivered; fill it in here.
+                if isinstance(exc, StreamInterrupted) and not exc.partial:
+                    exc.partial = partial
+                self._finish(_outcome_for(exc))
+                raise
+            except Exception as exc:  # noqa: BLE001 - surfaced as StreamInterrupted
+                partial = "".join(parts)
+                self.result.text = partial
+                self._finish("stream_interrupted")
+                raise StreamInterrupted(
+                    f"stream interrupted after {len(partial)} characters",
+                    partial=partial,
+                    cause=exc,
+                ) from exc
             self.result.text = "".join(parts)
-            self._finish(_outcome_for(exc))
-            raise
-        except Exception as exc:  # noqa: BLE001 - surfaced as StreamInterrupted
-            partial = "".join(parts)
-            self.result.text = partial
-            self._finish("stream_interrupted")
-            raise StreamInterrupted(
-                f"stream interrupted after {len(partial)} characters", partial=partial, cause=exc
-            ) from exc
-        self.result.text = "".join(parts)
-        self._finish("ok")
+            self._finish("ok")
+        finally:
+            # Also runs on GeneratorExit when a consumer abandons the stream, so
+            # an unread stream cannot leak its slot.
+            self.close()
+
+    def close(self) -> None:
+        """Release resources held for this stream. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._on_close is not None:
+            self._on_close()
+
+    def __enter__(self) -> StreamHandle:
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 
     def _finish(self, outcome: str) -> None:
         if self._finished:
@@ -189,6 +223,9 @@ class ResilientChatClient:
         metrics: Metrics | None = None,
         logger: StructuredLogger | None = None,
         single_flight: SingleFlight | None = None,
+        bulkhead: Bulkhead | None = None,
+        shedder: QueueDepthShedder | None = None,
+        stream_idle_timeout: float | None = None,
         injection_threshold: float = 0.6,
         redact_upstream: bool = False,
         cost_fn: Callable[[int, int], float] | None = None,
@@ -204,6 +241,9 @@ class ResilientChatClient:
         self.retry = retry
         self.redactor = redactor
         self.detector = detector
+        self.bulkhead = bulkhead
+        self.shedder = shedder
+        self.stream_idle_timeout = stream_idle_timeout
         self.metrics = metrics or Metrics()
         self.logger = logger or StructuredLogger()
         self.single_flight = single_flight
@@ -347,7 +387,16 @@ class ResilientChatClient:
                     return result
 
             def call() -> str:
-                response = self._invoke(payload, False)
+                # Shedding and bulkheading guard the *upstream call* only: a
+                # cache hit costs the GPU nothing and must never be rejected
+                # for load reasons.
+                if self.shedder is not None:
+                    self.shedder.check()
+                if self.bulkhead is not None:
+                    with self.bulkhead.slot():
+                        response = self._invoke(payload, False)
+                else:
+                    response = self._invoke(payload, False)
                 text = extract_text(response)
                 reported_prompt, reported_completion = extract_usage(response)
                 if reported_prompt:
@@ -416,7 +465,22 @@ class ResilientChatClient:
                 "stream": True,
                 **extra,
             }
-            chunks = self._invoke(payload, True)
+            if self.shedder is not None:
+                self.shedder.check()
+
+            # A streaming request occupies its upstream connection until the
+            # last token, so the slot is held for the stream's lifetime, not
+            # just the call that opens it.
+            holding_slot = False
+            if self.bulkhead is not None:
+                self.bulkhead.acquire_or_raise()
+                holding_slot = True
+            try:
+                chunks = self._invoke(payload, True)
+            except BaseException:
+                if holding_slot:
+                    self.bulkhead.release()
+                raise
             result.attempts = self.retry.attempts_made if self.retry is not None else 1
         except LLMBoxError as exc:
             result.latency_ms = (self._clock() - started) * 1000
@@ -427,7 +491,19 @@ class ResilientChatClient:
             final.latency_ms = (self._clock() - started) * 1000
             self._record(final, outcome, tenant)
 
-        return StreamHandle(iter_stream_deltas(chunks), result, on_done)
+        def on_close() -> None:
+            if holding_slot:
+                self.bulkhead.release()
+
+        source: Any = chunks
+        if self.stream_idle_timeout is not None:
+            # Watchdog on the gap between tokens: an open-but-silent socket
+            # never raises on its own.
+            source = iter_with_idle_timeout(source, self.stream_idle_timeout)
+
+        return StreamHandle(
+            iter_stream_deltas(source), result, on_done, on_close=on_close
+        )
 
     # ------------------------------------------------------------------ #
     def _record(
@@ -480,12 +556,22 @@ class ResilientChatClient:
         )
 
 
+# The `outcome` label vocabulary. Exported so alerting rules can be checked
+# against it: an alert selecting an outcome this code never emits is silently
+# dead, and that is not visible from either side on its own.
+ERROR_OUTCOMES = {
+    "RateLimitExceeded": "rate_limited",
+    "CircuitOpen": "circuit_open",
+    "ContextOverflow": "context_overflow",
+    "GuardrailBlocked": "guardrail_blocked",
+    "StreamInterrupted": "stream_interrupted",
+    "StreamStalled": "stream_stalled",
+    "Overloaded": "overloaded",
+    "UpstreamError": "upstream_error",
+}
+
+KNOWN_OUTCOMES = frozenset(ERROR_OUTCOMES.values()) | {"ok", "cache_hit", "error"}
+
+
 def _outcome_for(exc: BaseException) -> str:
-    return {
-        "RateLimitExceeded": "rate_limited",
-        "CircuitOpen": "circuit_open",
-        "ContextOverflow": "context_overflow",
-        "GuardrailBlocked": "guardrail_blocked",
-        "StreamInterrupted": "stream_interrupted",
-        "UpstreamError": "upstream_error",
-    }.get(type(exc).__name__, "error")
+    return ERROR_OUTCOMES.get(type(exc).__name__, "error")

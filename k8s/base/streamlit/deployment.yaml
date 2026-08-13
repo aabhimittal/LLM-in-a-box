@@ -28,6 +28,8 @@ spec:
           ports:
             - name: http
               containerPort: 8501
+            - name: metrics
+              containerPort: 9100
           envFrom:
             - configMapRef:
                 name: streamlit-config

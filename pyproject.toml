@@ -14,7 +14,8 @@ dependencies = []
 
 [project.optional-dependencies]
 ui = ["streamlit>=1.37", "openai>=1.40"]
-dev = ["pytest>=8.0"]
+# PyYAML reads the alerting rules; promql-parser validates their expressions.
+dev = ["pytest>=8.0", "pyyaml>=6.0", "promql-parser>=0.4"]
 
 [tool.setuptools]
 packages = ["llmbox"]

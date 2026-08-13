@@ -14,6 +14,7 @@ import pytest
 
 from conftest import RecordingBackend, chat_response, stream_chunks
 from llmbox import (
+    Bulkhead,
     CircuitBreaker,
     CircuitState,
     ContextBudget,
@@ -21,14 +22,17 @@ from llmbox import (
     InjectionDetector,
     Metrics,
     PromptCache,
+    QueueDepthShedder,
     RateLimiter,
     Redactor,
     ResilientChatClient,
     RetryPolicy,
     SingleFlight,
+    StreamStalled,
     UpstreamError,
+    UpstreamLoadSignal,
 )
-from llmbox.errors import CircuitOpen, RateLimitExceeded
+from llmbox.errors import CircuitOpen, Overloaded, RateLimitExceeded
 from llmbox.tokens import count_message_tokens
 
 ASK = [{"role": "user", "content": "explain kubernetes scheduling"}]
@@ -395,3 +399,195 @@ def test_metrics_exposition_is_well_formed_after_mixed_traffic(clock):
     assert metrics.value("llmbox_requests_total", {"outcome": "rate_limited", "model": "llama-3-8b-instruct"}) == 1
     assert metrics.value("llmbox_requests_total", {"outcome": "guardrail_blocked", "model": "llama-3-8b-instruct"}) == 1
     assert metrics.value("llmbox_guardrail_blocks_total", {"reason": "prompt_injection"}) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 7. Silent saturation: the failure a circuit breaker cannot see
+# --------------------------------------------------------------------------- #
+
+
+def test_bulkhead_bounds_concurrent_load_on_the_gpu(clock):
+    """A saturated vLLM queues rather than failing, so error-rate protection
+    never trips. The bulkhead converts that into an explicit rejection."""
+    concurrent = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+    release = threading.Event()
+
+    def slow_backend(payload, stream):
+        with lock:
+            concurrent["now"] += 1
+            concurrent["peak"] = max(concurrent["peak"], concurrent["now"])
+        release.wait(timeout=5)
+        with lock:
+            concurrent["now"] -= 1
+        return chat_response("done")
+
+    client = client_for(
+        slow_backend, clock, cache=None, single_flight=None, bulkhead=Bulkhead(max_concurrent=4)
+    )
+    outcomes: list[str] = []
+    barrier = threading.Barrier(20)
+
+    def worker(index):
+        barrier.wait()
+        try:
+            client.chat([{"role": "user", "content": f"question {index}"}])
+            outcomes.append("ok")
+        except Overloaded:
+            outcomes.append("shed")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    # Let the admitted requests pile up against the limit before releasing.
+    threading.Event().wait(0.2)
+    release.set()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert concurrent["peak"] <= 4  # the GPU never saw more than the limit
+    assert outcomes.count("shed") > 0  # the excess was rejected, not queued
+    assert len(outcomes) == 20
+
+
+def test_cache_hits_are_never_shed_for_load(clock):
+    """A cache hit costs the GPU nothing; rejecting it would be pure loss."""
+    bulkhead = Bulkhead(max_concurrent=1)
+    backend = RecordingBackend([chat_response("cached answer")])
+    client = client_for(backend, clock, bulkhead=bulkhead, single_flight=None)
+
+    client.chat(ASK, temperature=0)  # prime the cache
+    bulkhead.acquire_or_raise()  # occupy the only slot
+    try:
+        result = client.chat(ASK, temperature=0)
+        assert result.cached
+        assert result.text == "cached answer"
+        assert backend.call_count == 1
+    finally:
+        bulkhead.release()
+
+
+def test_bulkhead_slot_is_held_for_the_life_of_a_stream(clock):
+    """A streaming request owns its upstream connection until the last token."""
+    bulkhead = Bulkhead(max_concurrent=1)
+    backend = RecordingBackend([stream_chunks("a", "b", "c")])
+    client = client_for(backend, clock, bulkhead=bulkhead, cache=None)
+
+    handle = client.stream(ASK)
+    assert bulkhead.in_flight == 1  # held before the first token is read
+    assert "".join(handle) == "abc"
+    assert bulkhead.in_flight == 0  # released on completion
+
+
+def test_abandoned_stream_releases_its_slot(clock):
+    """Otherwise a user closing a tab permanently consumes capacity."""
+    bulkhead = Bulkhead(max_concurrent=1)
+    backend = RecordingBackend([stream_chunks(*[f"tok{i} " for i in range(50)])])
+    client = client_for(backend, clock, bulkhead=bulkhead, cache=None)
+
+    handle = client.stream(ASK)
+    for index, _ in enumerate(handle):
+        if index == 2:
+            break  # user navigates away
+    handle.close()
+    assert bulkhead.in_flight == 0
+
+
+def test_failed_stream_start_does_not_leak_a_slot(clock):
+    bulkhead = Bulkhead(max_concurrent=1)
+    backend = RecordingBackend([UpstreamError("boom", status_code=500, retryable=False)])
+    client = client_for(backend, clock, bulkhead=bulkhead, cache=None, retry=None)
+
+    with pytest.raises(UpstreamError):
+        client.stream(ASK)
+    assert bulkhead.in_flight == 0
+
+
+def test_stalled_stream_is_abandoned_with_partial_output(clock):
+    """An open-but-silent socket would otherwise hang the UI forever."""
+    hold = threading.Event()
+
+    def stalling_backend(payload, stream):
+        def gen():
+            yield {"choices": [{"delta": {"content": "thinking"}}]}
+            yield {"choices": [{"delta": {"content": " hard"}}]}
+            hold.wait(timeout=5)  # goes silent, never closes
+
+        return gen()
+
+    client = client_for(
+        stalling_backend, clock, cache=None, stream_idle_timeout=0.15
+    )
+    handle = client.stream(ASK)
+    seen = []
+    with pytest.raises(StreamStalled) as excinfo:
+        for delta in handle:
+            seen.append(delta)
+
+    assert "".join(seen) == "thinking hard"
+    assert excinfo.value.partial == "thinking hard"  # not lost
+    assert handle.result.text == "thinking hard"
+    hold.set()
+
+
+def test_upstream_queue_depth_sheds_before_latency_collapses(clock):
+    """vLLM publishes its own queue depth; act on it rather than on timeouts."""
+    depth = {"value": 20.0}
+    signal = UpstreamLoadSignal(
+        lambda: f"vllm:num_requests_waiting{{model_name=\"m\"}} {depth['value']}\n",
+        ttl=1.0,
+        clock=clock,
+    )
+    backend = RecordingBackend()
+    client = client_for(
+        backend,
+        clock,
+        cache=None,
+        shedder=QueueDepthShedder(signal, max_depth=8, retry_after=5.0),
+    )
+
+    with pytest.raises(Overloaded) as excinfo:
+        client.chat(ASK)
+    assert excinfo.value.source == "upstream_queue"
+    assert excinfo.value.depth == 20.0
+    assert backend.call_count == 0  # shed before adding to the queue
+
+    depth["value"] = 1.0
+    clock.advance(2.0)  # let the cached reading expire
+    assert client.chat(ASK).text  # recovers automatically
+
+
+def test_a_broken_metrics_endpoint_does_not_stop_serving(clock):
+    """Fail open: a monitoring outage must not become a serving outage."""
+
+    def broken():
+        raise ConnectionError("metrics endpoint refused connection")
+
+    client = client_for(
+        RecordingBackend(),
+        clock,
+        cache=None,
+        shedder=QueueDepthShedder(UpstreamLoadSignal(broken, clock=clock), max_depth=0),
+    )
+    assert client.chat(ASK).text  # traffic still flows
+
+
+def test_shed_requests_are_visible_in_metrics(clock):
+    metrics = Metrics()
+    client = client_for(
+        RecordingBackend(),
+        clock,
+        cache=None,
+        metrics=metrics,
+        bulkhead=Bulkhead(max_concurrent=1),
+    )
+    client.bulkhead.acquire_or_raise()
+    try:
+        with pytest.raises(Overloaded):
+            client.chat(ASK)
+    finally:
+        client.bulkhead.release()
+
+    assert metrics.value(
+        "llmbox_requests_total", {"outcome": "overloaded", "model": "llama-3-8b-instruct"}
+    ) == 1

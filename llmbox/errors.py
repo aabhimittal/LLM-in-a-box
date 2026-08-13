@@ -81,3 +81,37 @@ class StreamInterrupted(UpstreamError):
     def __init__(self, message: str, partial: str = "", cause: BaseException | None = None):
         super().__init__(message, retryable=True, cause=cause)
         self.partial = partial
+
+
+class StreamStalled(StreamInterrupted):
+    """A stream stopped producing tokens without closing.
+
+    Distinct from :class:`StreamInterrupted`: nothing failed, the connection is
+    simply idle. Left unchecked this hangs the caller forever, because a socket
+    that is open but silent never raises.
+    """
+
+    def __init__(self, message: str, idle_seconds: float = 0.0, partial: str = ""):
+        super().__init__(message, partial=partial)
+        self.idle_seconds = idle_seconds
+
+
+class Overloaded(LLMBoxError):
+    """The request was shed to protect the model server.
+
+    Raised when this process already has as many requests in flight as it is
+    willing to hold (``source="bulkhead"``), or when the upstream's own queue is
+    too deep to accept more work (``source="upstream_queue"``).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        retry_after: float | None = None,
+        source: str = "bulkhead",
+        depth: float | None = None,
+    ):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.source = source
+        self.depth = depth

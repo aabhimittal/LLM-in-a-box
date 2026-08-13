@@ -57,12 +57,22 @@ testable and injectable; the composed order in `client.py` is deliberate:
 | 3. Rate limiting | `ratelimit.py` | Priced in tokens, not requests. |
 | 4. Cache | `cache.py` | Consulted only for deterministic requests. |
 | 5. Single-flight | `cache.py` | Collapses a concurrent herd onto one generation. |
-| 6. Breaker → retry | `resilience.py` | The breaker is *inside* the retry loop, so an open circuit aborts immediately rather than burning the retry budget. |
+| 6. Queue-depth shed | `loadsignal.py` | Guards the *upstream call only*, so a cache hit is never rejected for load. Fails open. |
+| 7. Bulkhead | `concurrency.py` | Bounds total in-flight work; held for a stream's whole lifetime. |
+| 8. Breaker → retry | `resilience.py` | The breaker is *inside* the retry loop, so an open circuit aborts immediately rather than burning the retry budget. |
+
+Stages 6 and 7 exist because a saturated vLLM does not fail, it **queues**:
+requests keep succeeding, just slower, so nothing error-rate-based ever trips.
+The bulkhead bounds concurrency locally; the shedder reads the server's own
+`vllm:num_requests_waiting` gauge, which rises before users notice latency.
 
 Supporting modules: `tokens.py` (script-aware estimation — the `len/4` rule
-undercounts CJK by 3-5x), `observability.py` (JSON logs and a Prometheus
-registry), `errors.py` (a typed hierarchy so callers branch on structure, not on
-error strings).
+undercounts CJK by 3-5x), `streaming.py` (a watchdog on the gap *between*
+tokens, because an open-but-silent socket never raises), `observability.py`
+(JSON logs and a Prometheus registry), `metrics_server.py` (serves `/metrics`
+and `/healthz` on port 9100 — the only place requests rejected before reaching
+the model are visible), `errors.py` (a typed hierarchy so callers branch on
+structure, not on error strings).
 
 The backend is an injected callable `(payload, stream) -> response`, which is
 why the library has no HTTP dependency and the whole suite runs without a
@@ -87,7 +97,7 @@ Ingress (Traefik)  ──►  Service streamlit:8501  ──►  Streamlit pod
                                                         ▼
                                             llmbox: guardrails → budget →
                                             rate limit → cache → single-flight
-                                            → breaker → retry
+                                            → shed → bulkhead → breaker → retry
                                                         │  openai client
                                                         │  POST /v1/chat/completions (stream=true)
                                                         ▼
@@ -98,8 +108,9 @@ Ingress (Traefik)  ──►  Service streamlit:8501  ──►  Streamlit pod
 2. `llmbox` screens the input, trims the conversation to fit the context window,
    charges the user's token budget, and checks the cache. A cache hit or a
    rejection returns here — the GPU is never touched.
-3. Otherwise the request goes upstream under the circuit breaker and retry
-   policy, with concurrent identical prompts collapsed into one call.
+3. Otherwise the request goes upstream under the bulkhead, circuit breaker and
+   retry policy, with concurrent identical prompts collapsed into one call and
+   load shed if vLLM's own queue is already too deep.
 4. vLLM generates tokens on the GPU and streams them back.
 5. Streamlit renders tokens incrementally, and surfaces any trimming, truncation
    or redaction that occurred as a caption under the reply.
@@ -123,5 +134,11 @@ Ingress (Traefik)  ──►  Service streamlit:8501  ──►  Streamlit pod
 * **More throughput:** vLLM already batches requests continuously; a single
   replica serves many concurrent users. Horizontal scaling requires
   `ReadWriteMany` storage (or per-pod caches) and a load balancer in front.
+* **Multiple UI replicas:** the cache, rate-limiter buckets and bulkhead are
+  **per-pod, in-memory**. With N replicas the effective limits are multiplied by
+  N and cache hit rate drops, so divide `LLMBOX_MAX_CONCURRENT` and the token
+  budgets by the replica count, or move that state to a shared store. The
+  queue-depth shedder is unaffected — it reads a single global signal from vLLM,
+  which is precisely why it is the most reliable of the three under scale-out.
 * **Multiple models:** run a second vLLM Deployment/Service with its own
   ConfigMap and point additional UI instances (or a router) at them.

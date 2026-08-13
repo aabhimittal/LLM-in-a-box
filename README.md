@@ -21,14 +21,15 @@ self-hosted, no external API calls.
   standard `openai` Python client — so you can point it at any OpenAI-compatible
   backend.
 * **`llmbox`** is a dependency-free serving-edge library sitting between the two:
-  context budgeting, token-priced rate limiting, deterministic response caching
-  with stampede protection, PII redaction, prompt-injection screening, circuit
-  breaking with jittered retries, and structured telemetry.
+  context budgeting, token-priced rate limiting, bounded concurrency, response
+  caching with stampede protection, PII redaction, prompt-injection screening,
+  circuit breaking with jittered retries, stream stall detection, load shedding
+  driven by vLLM's own queue depth, and a Prometheus endpoint.
 * Everything is packaged as plain Kubernetes manifests plus a Kustomize base, a
   CPU-only test overlay and a Prometheus overlay.
 
-Every production behaviour above is covered by a **172-test suite that needs no
-GPU and no cluster** and runs in ~2 seconds (`make test`). See
+Every production behaviour above is covered by a **234-test suite that needs no
+GPU and no cluster** (`make test`). See
 [`docs/EDGE-CASES.md`](docs/EDGE-CASES.md) for the catalogue of failure modes
 handled and where each is tested.
 
@@ -43,12 +44,17 @@ handled and where each is tested.
 │   ├── context.py            #   context-window budgeting & safe truncation
 │   ├── ratelimit.py          #   token-bucket admission control
 │   ├── cache.py              #   LRU+TTL cache and single-flight
+│   ├── concurrency.py        #   bulkhead: bounded in-flight requests
+│   ├── streaming.py          #   stall detection on token streams
+│   ├── loadsignal.py         #   shed on vLLM's own queue depth (fails open)
 │   ├── guardrails.py         #   PII redaction, prompt-injection screening
 │   ├── resilience.py         #   circuit breaker, retry with full jitter
 │   ├── observability.py      #   structured logs, Prometheus metrics
+│   ├── metrics_server.py     #   /metrics + /healthz scrape endpoint
 │   └── client.py             #   composes all of the above
-├── tests/                    # 172 tests; no GPU or cluster required
+├── tests/                    # 234 tests; no GPU or cluster required
 │   ├── test_edge_cases.py    #   industrial failure scenarios
+│   ├── test_alerts.py        #   PromQL + metric/label cross-checks
 │   └── test_integration_openai.py  # real openai SDK vs a stub vLLM server
 ├── ui/                       # Streamlit chat application
 │   ├── app.py                #   streaming chat UI built on llmbox
@@ -173,11 +179,25 @@ The same ConfigMap tunes the `llmbox` layer:
 | `LLMBOX_CACHE_ENTRIES`       | `512`   | Max cached responses                                      |
 | `LLMBOX_CACHE_TTL`           | `300`   | Cache TTL in seconds                                      |
 | `LLMBOX_INJECTION_THRESHOLD` | `0.6`   | Prompt-injection block score in `[0,1]`                   |
+| `LLMBOX_MAX_CONCURRENT`      | `16`    | In-flight upstream requests allowed from this pod          |
+| `LLMBOX_STREAM_IDLE_TIMEOUT` | `60`    | Seconds of silence before a stream is treated as stalled   |
+| `LLMBOX_MAX_QUEUE_DEPTH`     | `8`     | Shed while vLLM's own queue is deeper than this            |
+| `LLMBOX_VLLM_METRICS_URL`    | derived | vLLM `/metrics`; empty string disables queue-depth shedding |
+| `LLMBOX_METRICS_PORT`        | `9100`  | Port serving this app's `/metrics` and `/healthz`          |
 
 Rate limiting is priced in **tokens, not requests**, so a handful of very large
 prompts cannot monopolise the GPU while staying under a request-count cap. Only
 `temperature=0` responses are cached — replaying a sampled completion would
 silently destroy sampling diversity.
+
+The bulkhead and queue-depth shedder cover the failure a circuit breaker cannot
+see: a saturated vLLM does not fail, it *queues*, so error-rate protection never
+trips while latency collapses. Queue-depth shedding **fails open** — if vLLM's
+`/metrics` is unreachable, traffic flows rather than being shed on a guess.
+
+The UI pod serves its own `/metrics` on port 9100, which is where requests
+rejected *before* reaching the model appear; they are absent from every `vllm:*`
+series by construction.
 
 ### Using `llmbox` on its own
 
@@ -217,7 +237,7 @@ Or run the bundled smoke test: `make smoke-test`.
 
 ```bash
 make help          # list every target
-make test          # run the llmbox test suite (no GPU, no cluster, ~2s)
+make test          # run the llmbox test suite (no GPU, no cluster)
 make status        # pods, services, ingress
 make logs          # tail vLLM logs
 make lint          # client-side validate all manifests
