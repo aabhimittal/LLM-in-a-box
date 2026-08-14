@@ -1,0 +1,103 @@
+# Alerts chosen for what actually goes wrong on a single-GPU deployment.
+# Metric names follow vLLM's exporter (vllm:* series).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: llm-in-a-box
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+spec:
+  groups:
+    - name: llm-in-a-box.rules
+      rules:
+        - alert: VLLMDown
+          expr: up{job=~".*vllm.*"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "vLLM is not being scraped"
+            description: >-
+              The model server has been unreachable for 5 minutes. On a cold
+              start this is expected while weights load; beyond that, check
+              `kubectl -n llm-in-a-box logs deploy/vllm`.
+
+        - alert: VLLMRequestQueueBacklog
+          # Requests waiting rather than running means the GPU is saturated.
+          expr: vllm:num_requests_waiting > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Requests are queueing for the GPU"
+            description: >-
+              Sustained queueing for 10 minutes. Lower per-user token budgets,
+              reduce max_model_len, or add GPU capacity.
+
+        - alert: VLLMKVCacheNearlyFull
+          # Once KV cache utilisation saturates, vLLM starts preempting.
+          expr: vllm:gpu_cache_usage_perc > 0.95
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "KV cache above 95%"
+            description: >-
+              vLLM will begin preempting and recomputing sequences, which shows
+              up to users as erratic latency.
+
+        - alert: VLLMSlowTimeToFirstToken
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le)
+            ) > 5
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "p95 time-to-first-token above 5s"
+            description: >-
+              The UI streams tokens, so TTFT is what users perceive as
+              responsiveness. Sustained high TTFT usually means queueing.
+
+        - alert: LLMBoxSheddingLoad
+          # Requests rejected before reaching the model. Invisible in vllm:*.
+          expr: |
+            sum(rate(llmbox_requests_total{outcome=~"overloaded|rate_limited"}[5m])) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "The serving edge is shedding requests"
+            description: >-
+              Sustained rejections for load. Either the GPU is undersized for
+              demand, or LLMBOX_MAX_CONCURRENT / the per-user token budget is
+              set too low for legitimate traffic.
+
+        - alert: LLMBoxStreamsStalling
+          expr: sum(rate(llmbox_requests_total{outcome="stream_stalled"}[15m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Token streams are stalling mid-generation"
+            description: >-
+              The model server accepted requests then went silent. Usually
+              preemption under KV-cache pressure; check
+              vllm:gpu_cache_usage_perc and num_requests_waiting.
+
+        - alert: LLMBoxUpstreamErrorsUsersSee
+          expr: |
+            sum(rate(llmbox_requests_total{outcome=~"upstream_error|circuit_open"}[5m]))
+            /
+            clamp_min(sum(rate(llmbox_requests_total[5m])), 0.001) > 0.05
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "More than 5% of chat requests are failing"
+            description: >-
+              Measured at the serving edge rather than on the model server, so
+              it includes failures vLLM never saw.

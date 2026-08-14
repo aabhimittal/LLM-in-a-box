@@ -1,0 +1,21 @@
+# vLLM exposes Prometheus metrics on /metrics of the same port as the API,
+# including the two that actually predict user-visible pain: queue depth and
+# time-to-first-token.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+    app.kubernetes.io/component: vllm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: vllm
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      # Model loading can stall scrapes; fail fast rather than backing up.
+      scrapeTimeout: 10s

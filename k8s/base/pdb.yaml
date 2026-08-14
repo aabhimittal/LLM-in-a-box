@@ -1,0 +1,33 @@
+# Node drains (upgrades, autoscaling) evict pods without regard for how long
+# they take to come back. vLLM needs minutes to reload weights, so an
+# unprotected drain is a multi-minute outage.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+    app.kubernetes.io/component: vllm
+spec:
+  # With a single replica this makes a voluntary eviction require explicit
+  # operator intent (`kubectl drain --disable-eviction`), which is the point:
+  # the disruption should be deliberate, not incidental.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: vllm
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: streamlit
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+    app.kubernetes.io/component: ui
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: streamlit

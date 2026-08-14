@@ -1,7 +1,9 @@
 # Streamlit chat UI for LLM-in-a-Box.
+#
+# Build from the REPOSITORY ROOT so the llmbox package is in the build context:
+#   docker build -f ui/Dockerfile -t llm-in-a-box/streamlit-ui:latest .
 FROM python:3.11-slim
 
-# Avoid interactive prompts and keep the image lean.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -13,12 +15,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Install dependencies first to leverage Docker layer caching.
-COPY requirements.txt .
+COPY ui/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code.
-COPY app.py .
-COPY .streamlit ./.streamlit
+# The serving-edge library (dependency-free) and the UI itself.
+COPY llmbox ./llmbox
+COPY ui/app.py .
+COPY ui/.streamlit ./.streamlit
 
 # Run as a non-root user.
 RUN useradd --create-home --uid 10001 appuser \
@@ -27,7 +30,6 @@ USER appuser
 
 EXPOSE 8501
 
-# Basic container health check.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" || exit 1
 

@@ -1,0 +1,73 @@
+# Network isolation for the model server.
+#
+# The whole point of self-hosting is that prompts and weights stay inside the
+# cluster. Without a NetworkPolicy every pod in the cluster can reach the
+# inference API directly, bypassing the UI's guardrails, rate limits and audit
+# logging entirely.
+#
+# NOTE: k3s ships Flannel, which does NOT enforce NetworkPolicy by default.
+# Install a policy-capable CNI (Calico, Cilium) or run k3s with
+# `--flannel-backend=none` plus Calico for these rules to take effect. Applying
+# them on a cluster without enforcement is harmless but provides no protection.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vllm-ingress
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+spec:
+  podSelector:
+    matchLabels:
+      app: vllm
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the UI may call the inference API.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: streamlit
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Allow Prometheus (if deployed) to scrape metrics.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: streamlit-ingress
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+spec:
+  podSelector:
+    matchLabels:
+      app: streamlit
+  policyTypes:
+    - Ingress
+  ingress:
+    # Traefik runs in kube-system on k3s.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8501
+    # Prometheus scrapes the serving-edge metrics (rejections the model server
+    # never saw: rate limits, guardrail blocks, shed load).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9100

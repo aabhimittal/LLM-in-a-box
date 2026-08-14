@@ -1,0 +1,23 @@
+# Scrapes the serving edge's own metrics.
+#
+# This is the half of the picture vLLM cannot provide: requests that were
+# rejected *before* reaching the model — rate-limited, guardrail-blocked, or
+# shed for load — never appear in vllm:* series at all. When users report
+# failures the model server has no record of, this is where they are.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: streamlit
+  namespace: llm-in-a-box
+  labels:
+    app.kubernetes.io/part-of: llm-in-a-box
+    app.kubernetes.io/component: ui
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: ui
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

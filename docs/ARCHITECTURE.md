@@ -30,13 +30,54 @@ more shared memory than the container default.
 ### Streamlit UI
 
 * **Image:** built from `ui/Dockerfile` (Python 3.11 slim + Streamlit +
-  `openai`).
-* **What it does:** renders a streaming chat interface. It uses the `openai`
-  client pointed at the in-cluster vLLM Service, so it is backend-agnostic.
+  `openai`), with the build context at the repository root so the `llmbox`
+  package ships alongside the app.
+* **What it does:** renders a streaming chat interface. All production
+  behaviour is delegated to `llmbox`; the module itself is presentation only.
 * **Model selection:** if `VLLM_MODEL` is set it uses that; otherwise it calls
   `/v1/models` and picks the first served model automatically.
 * **Health:** a sidebar indicator calls `/v1/models` to show whether vLLM is
-  reachable and which model is live.
+  reachable and which model is live, alongside live cache hit-rate, circuit
+  state and the raw Prometheus exposition.
+
+Streamlit re-runs the whole script on every interaction, so the `llmbox` client
+is built inside `@st.cache_resource`. That is not an optimisation: the cache,
+rate-limiter buckets and circuit-breaker state are meaningless if they are
+rebuilt on each keystroke.
+
+### `llmbox` — the serving edge
+
+A dependency-free library between the UI and vLLM. Each concern is independently
+testable and injectable; the composed order in `client.py` is deliberate:
+
+| Stage | Module | Why it sits here |
+| --- | --- | --- |
+| 1. Guardrails | `guardrails.py` | Cheapest check, and must run before the text is used for anything — including logging. |
+| 2. Context budgeting | `context.py` | Determines the true token cost the limiter needs, and guarantees the request *can* succeed. |
+| 3. Rate limiting | `ratelimit.py` | Priced in tokens, not requests. |
+| 4. Cache | `cache.py` | Consulted only for deterministic requests. |
+| 5. Single-flight | `cache.py` | Collapses a concurrent herd onto one generation. |
+| 6. Queue-depth shed | `loadsignal.py` | Guards the *upstream call only*, so a cache hit is never rejected for load. Fails open. |
+| 7. Bulkhead | `concurrency.py` | Bounds total in-flight work; held for a stream's whole lifetime. |
+| 8. Breaker → retry | `resilience.py` | The breaker is *inside* the retry loop, so an open circuit aborts immediately rather than burning the retry budget. |
+
+Stages 6 and 7 exist because a saturated vLLM does not fail, it **queues**:
+requests keep succeeding, just slower, so nothing error-rate-based ever trips.
+The bulkhead bounds concurrency locally; the shedder reads the server's own
+`vllm:num_requests_waiting` gauge, which rises before users notice latency.
+
+Supporting modules: `tokens.py` (script-aware estimation — the `len/4` rule
+undercounts CJK by 3-5x), `streaming.py` (a watchdog on the gap *between*
+tokens, because an open-but-silent socket never raises), `observability.py`
+(JSON logs and a Prometheus registry), `metrics_server.py` (serves `/metrics`
+and `/healthz` on port 9100 — the only place requests rejected before reaching
+the model are visible), `errors.py` (a typed hierarchy so callers branch on
+structure, not on error strings).
+
+The backend is an injected callable `(payload, stream) -> response`, which is
+why the library has no HTTP dependency and the whole suite runs without a
+server. See [`EDGE-CASES.md`](EDGE-CASES.md) for the failure modes each layer
+addresses.
 
 ### Networking
 
@@ -52,6 +93,11 @@ Browser
   │  HTTP / websocket
   ▼
 Ingress (Traefik)  ──►  Service streamlit:8501  ──►  Streamlit pod
+                                                        │
+                                                        ▼
+                                            llmbox: guardrails → budget →
+                                            rate limit → cache → single-flight
+                                            → shed → bulkhead → breaker → retry
                                                         │  openai client
                                                         │  POST /v1/chat/completions (stream=true)
                                                         ▼
@@ -59,10 +105,15 @@ Ingress (Traefik)  ──►  Service streamlit:8501  ──►  Streamlit pod
 ```
 
 1. The user sends a message in the browser.
-2. Streamlit builds the payload (system prompt + conversation history) and calls
-   vLLM's `/v1/chat/completions` with `stream=true`.
-3. vLLM generates tokens on the GPU and streams them back.
-4. Streamlit renders tokens incrementally in the chat window.
+2. `llmbox` screens the input, trims the conversation to fit the context window,
+   charges the user's token budget, and checks the cache. A cache hit or a
+   rejection returns here — the GPU is never touched.
+3. Otherwise the request goes upstream under the bulkhead, circuit breaker and
+   retry policy, with concurrent identical prompts collapsed into one call and
+   load shed if vLLM's own queue is already too deep.
+4. vLLM generates tokens on the GPU and streams them back.
+5. Streamlit renders tokens incrementally, and surfaces any trimming, truncation
+   or redaction that occurred as a caption under the reply.
 
 ## Design choices
 
@@ -83,5 +134,11 @@ Ingress (Traefik)  ──►  Service streamlit:8501  ──►  Streamlit pod
 * **More throughput:** vLLM already batches requests continuously; a single
   replica serves many concurrent users. Horizontal scaling requires
   `ReadWriteMany` storage (or per-pod caches) and a load balancer in front.
+* **Multiple UI replicas:** the cache, rate-limiter buckets and bulkhead are
+  **per-pod, in-memory**. With N replicas the effective limits are multiplied by
+  N and cache hit rate drops, so divide `LLMBOX_MAX_CONCURRENT` and the token
+  budgets by the replica count, or move that state to a shared store. The
+  queue-depth shedder is unaffected — it reads a single global signal from vLLM,
+  which is precisely why it is the most reliable of the three under scale-out.
 * **Multiple models:** run a second vLLM Deployment/Service with its own
   ConfigMap and point additional UI instances (or a router) at them.
